@@ -1,0 +1,122 @@
+---
+title: "Random Forest"
+author: "Anthony A. Boyles"
+date: "September 19, 2016"
+---
+
+```{r packages, message=FALSE}
+library("MASS")
+library("readr")
+library("magrittr")
+library("dplyr")
+library("ShRoud")
+library("e1071")
+```
+
+## Plan
+
+* Assemble the data!
+* Clean the data!
+* Model the data!
+* Make Some Predictions!
+
+## Assemble the Data!
+
+```{r readData, message=FALSE}
+rawtraining <- read_csv("rawdata/train.csv")
+rawtest <- read_csv("rawdata/test.csv")
+```
+
+That was uneventful. Now, to make a few, preliminary preparations...
+
+## Clean the Data!
+
+So, what do we have here? First off, Let's take care of those NAs, and turn my strings into factors.
+
+```{r fixMissingAndFactorize}
+# FixNAs and Factorize are both functions from my ShRoud package.
+temp <- rawtraining %>%
+  fixNAs() %>%
+  factorize()
+```
+
+With 81 variables, I'm guessing that there are going to be some which have rare factors, which could be a problem. If a rare factor falls in the test data but not the training data, we're going to have models that fail.
+
+```{r}
+temp %<>%
+  dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition)) %>%
+  mutate(
+    LotConfig = ifelse(LotConfig == "Inside", 1, 0)
+  ) %>%
+  dplyr::rename(
+    FirstFlrSF  = `1stFlrSF`,
+    SecondFlrSF = `2ndFlrSF`,
+    ThreeSsnPorch = `3SsnPorch`
+  )
+```
+
+I'm throwing away a ton of data here, but I really want to do a full-stack first pass, so I'll worry about mining these for signal in later iterations.
+
+Finally, let's partition the data into training and test sets for model building.
+
+```{r dataPrep}
+# There are a lot on NAs in the Data, which tend to gum things up. This is a handy function to slip into pipelines to 
+temp %<>% mutate(train = runif(n()) < .7)
+train <- temp %>% filter( train) %>% dplyr::select(-train)
+test  <- temp %>% filter(!train) %>% dplyr::select(-train)
+```
+
+## Model the Data!
+
+```{r SVM}
+model1 <- svm(SalePrice ~ ., data=train)
+prediction <- predict(model1, test, type="response")
+model_output <- cbind(test, prediction) %>%
+  mutate(
+    logPrediction = log(prediction),
+    logPrice = log(SalePrice)
+  )
+
+rmse(model_output$logPrice, model_output$logPrediction)
+```
+
+[Gah!](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/leaderboard)
+
+## Make Some Predictions!
+
+Let's rerun it on the entire Kaggle training set, predict on the test set, write and submit it.
+
+```{r writeOut}
+temp <- rawtraining %>%
+  fixNAs() %>%
+  factorize() %>%
+  dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition, KitchenQual)) %>%
+  mutate(
+    LotConfig = ifelse(LotConfig == "Inside", 1, 0)
+  ) %>%
+  dplyr::rename(
+    FirstFlrSF  = `1stFlrSF`,
+    SecondFlrSF = `2ndFlrSF`,
+    ThreeSsnPorch = `3SsnPorch`
+  )
+
+temp2 <- rawtest %>%
+  fixNAs() %>%
+  factorize() %>%
+  dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition, KitchenQual)) %>%
+  mutate(
+    LotConfig = ifelse(LotConfig == "Inside", 1, 0)
+  ) %>%
+  dplyr::rename(
+    FirstFlrSF  = `1stFlrSF`,
+    SecondFlrSF = `2ndFlrSF`,
+    ThreeSsnPorch = `3SsnPorch`
+  )
+
+model1 <- svm(SalePrice ~ ., data=temp)
+prediction <- predict(model1, temp2, type="response")
+
+cbind(temp2, prediction) %>%
+  dplyr::transmute(Id, SalePrice = prediction) %>%
+  write_csv("predictions/prediction3.csv")
+```
