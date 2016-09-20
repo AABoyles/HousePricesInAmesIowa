@@ -1,0 +1,171 @@
+---
+title: "Feature Engineering"
+author: "Anthony A. Boyles"
+date: "September 19, 2016"
+---
+
+```{r packages, message=FALSE}
+library("MASS")
+library("readr")
+library("magrittr")
+library("dplyr")
+library("ShRoud")
+library("ggplot2")
+library("e1071")
+library("purrr")
+```
+
+## Plan
+
+* Assemble the data!
+* Clean the data!
+* Write the data!
+
+## Assemble the Data!
+
+```{r readData, message=FALSE}
+rawtraining <- read_csv("rawdata/train.csv")
+rawtest <- read_csv("rawdata/test.csv")
+```
+
+That was uneventful. Now, to make a few, preliminary preparations...
+
+## Clean the Data!
+
+### Bad Names
+
+First things first! Some of these columns have names that start with numerals. That makes R ...itchy. Let's just fix that right quick:
+
+```{r}
+training <- rawtraining %>%
+  dplyr::rename(
+    FirstFlrSF  = `1stFlrSF`,
+    SecondFlrSF = `2ndFlrSF`,
+    ThreeSsnPorch = `3SsnPorch`
+  )
+```
+
+### Missing Values
+
+There are a ton of them. They make the models fail. In a perfect world, we would analyze each column for its missingness and do multiple imputation to fill in the values we could reasonably impute, but I don't have the time or the patience for that. Instead, I'm just going to replace all missing values with the arithmetic mean of values in the that column for numeric columns, and "Unknown" for character columns.
+
+```{r fixMissingAndFactorize}
+training <- fixNAs(training)
+```
+
+### Outcome Transformation
+
+If we take a look at the distribution of our outcome metric...
+
+```{r}
+training %>%
+  ggplot(aes(SalePrice)) +
+  geom_histogram()
+```
+
+You'll note that these values vary over several orders of magnitude (as [Alexandru Papieu pointed out](https://www.kaggle.com/apapiu/house-prices-advanced-regression-techniques/regularized-linear-models)), so it may make more sense to predict the log-transformation of the data.
+
+```{r}
+training %>%
+  ggplot(aes(log(SalePrice))) +
+  geom_histogram()
+```
+
+It certainly apprears to be closer to normally-distributed (which is helpful). OK, so to do this transformation, let's measure the skewness of each variable, and log-transform those with a high skewness.
+
+```{r}
+skewnessThreshold <- 3
+
+transformedColumns <- c()
+
+for(column in (colnames(training) %\% c("Id"))){
+  if(is.numeric(training[[column]])){
+    if(skewness(training[[column]]) > skewnessThreshold){
+      training[[column]] <- log1p(training[[column]])
+      transformedColumns <- c(transformedColumns, column)
+    }
+  }
+}
+```
+
+### The Rare Factors Problem
+
+The biggest problem I encountered in early modeling efforts was rare factors. Basically, what happens is we partition the data for cross-validation and there's a factor with one especially rare value. All instances of that rare value land in the test data, so we have no way to assign a coefficient to it, and the model fails.
+
+The simplest way to handle this is to drop any categorical variable with a value that is rarer than some tolerance threshold for model failure (basically, how patient you are). That's what I did for my first pass:
+
+```{r, eval=FALSE}
+# Note that this code is not run:
+training <- training %>% dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition, LotConfig))
+```
+
+A better way to solve this problem is to translate ordinal variables onto a continuous scale. A computer can't figure out how far "good" is from "poor," but it can definitely figure out the difference between 4 and 1. That works adequately for ordinal variables, but its throwing away some discernable signal, and it works less well for nominal variables. For example, there is no inherent ordinality in countertop materials, but the market values granite more highly than formica. This is particularly instructive: instead of assuming that an ordinal variable follows its order, let's actually take the mean price for each category and see whether it follows the implied ordering.
+
+So, let's take a category we'd otherwise throw away, and figure out how to numberify it.
+
+```{r}
+table(training$ExterCond)
+```
+
+Perfect. With a 70-30 training-test partitioning, the probability that Po ("Poor") has no representatives in the training data is .3, which is totally unworkable. (The generalized formula for that metric, by the way, is $P(\text{Model Failure}) = (1-\text{Training Proportion})^{\text{size of smallest category}}$.) To fix it, let's look at the mean house price for each member of the class:
+
+```{r}
+training %>%
+  group_by(ExterCond) %>%
+  summarise(AveragePrice = mean(SalePrice))
+```
+
+Here we can see that houses in Typical/Average shape on their exteriors actually fetch a slightly higher price, on average, than houses rated as being in "Good" shape. Cool! So, for every categorical variable that has a sufficiently high probability of causing a modeling failure, let's replace the categories with their average SalePrice.
+
+```{r}
+failureThreshold <- 1e-6
+
+transformedCategories <- list()
+
+for(column in colnames(training)){
+  if(is.character(training[[column]])){
+    if(.3^(min(table(training[[column]]))-1) > failureThreshold){
+      # This is not a sane way to do this, but I don't know any better way.
+      temp <- eval(parse(text = paste0("group_by(training, ", column, ")"))) %>%
+        summarise(AveragePrice = mean(SalePrice))
+      replacements <- as.list(temp$AveragePrice)
+      names(replacements) <- temp[[column]]
+      training <- eval(parse(text = paste0("mutate(training, ", column," = as.numeric(replacements[", column,"]))")))
+      transformedCategories[[column]] <- replacements
+    }
+  }
+}
+```
+
+## Write the Data!
+
+Training is all set to go!
+
+```{r writeTraining}
+write_csv(training, "deriveddata/training.csv")
+```
+
+Now we need to give test the same treatment...
+
+```{r fixTest}
+test <- rawtest %>%
+  dplyr::rename(
+    FirstFlrSF  = `1stFlrSF`,
+    SecondFlrSF = `2ndFlrSF`,
+    ThreeSsnPorch = `3SsnPorch`
+  ) %>%
+  fixNAs()
+
+for(column in transformedColumns %\% "SalePrice"){
+  test[[column]] <- log1p(test[[column]])
+}
+
+for(column in names(transformedCategories)){
+  replacements <- transformedCategories[[column]]
+  test <- eval(parse(text = paste0("mutate(test, ", column, " = replacements[test$", column, "][[1]])")))
+}
+
+write_csv(test, "deriveddata/test.csv")
+```
+
+And, we're done! On to the Modeling!
