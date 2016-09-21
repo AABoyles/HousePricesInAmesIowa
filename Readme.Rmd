@@ -11,23 +11,27 @@ Note: while I haven't actually used any code from it, I owe a debt of gratitude 
 
 ```{r loadPackages, message=FALSE}
 library("readr")
+library("plyr")
 library("dplyr")
+library("intubate")
 library("ggplot2")
+library("caret")
 library("MASS")
 library("glmnet")
 library("glmnetUtils")
 library("Cubist")
 library("randomForest")
 library("e1071")
+library("nnet")
 library("xgboost")
 library("ShRoud")
+library("magrittr")
 ```
 
 # Assemble the Data!
 
 ```{r readData, message=FALSE}
-rawtrain <- read_csv("rawdata/train.csv")
-rawtest  <- read_csv("rawdata/test.csv")
+training <- read_csv("rawdata/train.csv")
 ```
 
 That was uneventful.
@@ -39,7 +43,7 @@ That was uneventful.
 First things first! Some of these columns have names that start with numerals. That makes R ...itchy. Let's just fix that right quick:
 
 ```{r}
-training <- rawtrain %>%
+training %<>%
   dplyr::rename(
     FirstFlrSF  = `1stFlrSF`,
     SecondFlrSF = `2ndFlrSF`,
@@ -47,11 +51,37 @@ training <- rawtrain %>%
   )
 ```
 
+Note that this won't affect the models in any meaningful way.
+
+## Feature Engineering
+
+I could do my own, but [Thibaut95k](https://www.kaggle.com/thibaut95k/house-prices-advanced-regression-techniques/notebook44688d615f/run/370172) has already done such an awesome job.
+
+```{r}
+training %<>%
+  mutate(
+    Age = YrSold - YearBuilt,
+    AgeRemod = YrSold - YearRemodAdd,
+    Baths = FullBath + HalfBath,
+    BsmtBaths = BsmtFullBath + BsmtHalfBath,
+    OverallQualSquare = OverallQual*OverallQual,
+    OverallQualCube = OverallQual*OverallQual*OverallQual,
+    OverallQualExp = expm1(OverallQual),
+    GrLivAreaLog = log(GrLivArea),
+    TotalBsmtSFGrLivArea = TotalBsmtSF/GrLivArea,
+    OverallCondSqrt = sqrt(OverallCond),
+    OverallCondSquare = OverallCond*OverallCond,
+    LotAreaSqrt = sqrt(LotArea),
+    FirstFlrSFSqrt = sqrt(FirstFlrSF),
+    TotRmsAbvGrdSqrt = sqrt(TotRmsAbvGrd)
+  )
+```
+
 ## Missing Values
 
 There are a ton of them. They make the models fail. In a perfect world, we would analyze each column for its missingness and do multiple imputation to fill in the values we could reasonably impute, but I don't have the time or the patience for that. Instead, I'm just going to replace all missing values with the arithmetic mean of values in the that column for numeric columns, and "Unknown" for character columns.
 
-```{r fixMissingAndFactorize}
+```{r fixMissing}
 training <- fixNAs(training)
 ```
 
@@ -69,30 +99,39 @@ You'll note that these values vary over several orders of magnitude (as [Alexand
 
 ```{r}
 training %>%
-  ggplot(aes(log(SalePrice))) +
-  geom_histogram()
+  ggplot(aes(SalePrice)) +
+  geom_histogram() +
+  scale_x_log10()
 ```
 
-It certainly apprears to be closer to normally-distributed (which is helpful). OK, so to do this transformation, let's measure the skewness of each variable, and log-transform those with a high skewness.
+It certainly apprears to be closer to normally-distributed (which is helpful). What about the predictors? Well, let's take a look at some correlations:
+
+Note: I'll start cross-validating once I'm building models for prediction. These are just to determine whether or not a particular treatment (in this case, log-transformation) helps us.
 
 ```{r}
-skewnessThreshold <- 3
-
-transformedColumns <- c()
-
-for(column in (colnames(training) %\% c("Id"))){
-  if(is.numeric(training[[column]])){
-    if(skewness(training[[column]]) > skewnessThreshold){
-      training[[column]] <- log1p(training[[column]])
-      transformedColumns <- c(transformedColumns, column)
-    }
-  }
-}
+training %>%
+  ntbt_lm(SalePrice ~ .) %>%
+  summary() %>%
+  use_series(r.squared)
 ```
 
-## The Rare Factors Problem
+```{r}
+training %>%
+  mutate(SalePrice = log1p(SalePrice)) %>%
+  ntbt_lm(SalePrice ~ .) %>%
+  summary() %>%
+  use_series(r.squared)
+```
 
-The biggest problem I encountered in early modeling efforts was rare factors. Basically, what happens is we partition the data for cross-validation and there's a factor with one especially rare value. All instances of that rare value land in the test data, so we have no way to assign a coefficient to it, and the model fails.
+So we get a tiny boost from log-transforming the outcome. Let's keep it.
+
+```{r}
+training <- mutate(training, SalePrice = log1p(SalePrice))
+```
+
+## Near-Zero Variance
+
+The biggest problem I encountered in early modeling efforts was factors with values that occur infrequently in the data. Basically, what happens is we partition the data for cross-validation and there's a factor with one (or a few) especially rare value. All instances of that rare value land in the test data, so we have no way to assign a coefficient to it, and the model fails.
 
 The simplest way to handle this is to drop any categorical variable with a value that is rarer than some tolerance threshold for model failure (basically, how patient you are). That's what I did for my first pass:
 
@@ -126,48 +165,63 @@ transformedCategories <- list()
 
 for(column in colnames(training)){
   if(is.character(training[[column]])){
-    if(.3^(min(table(training[[column]]))-1) > failureThreshold){
-      # This is not a sane way to do this, but I don't know any better way.
-      temp <- eval(parse(text = paste0("group_by(training, ", column, ")"))) %>%
-        summarise(AveragePrice = mean(SalePrice))
-      replacements <- as.list(temp$AveragePrice)
-      names(replacements) <- temp[[column]]
-      training <- eval(parse(text = paste0("mutate(training, ", column," = as.numeric(replacements[", column,"]))")))
-      transformedCategories[[column]] <- replacements
-    }
+    # This is not a sane way to do this, but I don't know any better way.
+    temp <- eval(parse(text = paste0("group_by(training, ", column, ")"))) %>%
+      summarise(AveragePrice = mean(SalePrice))
+    replacements <- as.list(temp$AveragePrice)
+    names(replacements) <- temp[[column]]
+    training <- eval(parse(text = paste0("mutate(training, ", column," = as.numeric(replacements[", column,"]))")))
+    transformedCategories[[column]] <- replacements
   }
 }
 ```
 
-## Write the Data!
+OK, that's fun, but did it help us?
 
-Training is all set to go!
-
-```{r writeTraining}
-write_csv(training, "deriveddata/training.csv")
+```{r}
+training %>%
+  ntbt_lm(SalePrice ~ .) %>%
+  summary() %>%
+  use_series(r.squared)
 ```
 
-Now we need to give test the same treatment...
+Sadly, not, though it doesn't seem to hurt us much. More importantly, it resolves some modelling problems down the road, so Let's keep it anyway.
+
+## Write the Data!
+
+Training is all set to go! Now we just need to give test the same treatment...
 
 ```{r fixTest}
-test <- rawtest %>%
+preparedtraining <- training
+
+preparedtest <- read_csv("rawdata/test.csv") %>%
   dplyr::rename(
     FirstFlrSF  = `1stFlrSF`,
     SecondFlrSF = `2ndFlrSF`,
     ThreeSsnPorch = `3SsnPorch`
+  ) %>% 
+  mutate(
+    Age = YrSold - YearBuilt,
+    AgeRemod = YrSold - YearRemodAdd,
+    Baths = FullBath + HalfBath,
+    BsmtBaths = BsmtFullBath + BsmtHalfBath,
+    OverallQualSquare = OverallQual*OverallQual,
+    OverallQualCube = OverallQual*OverallQual*OverallQual,
+    OverallQualExp = expm1(OverallQual),
+    GrLivAreaLog = log(GrLivArea),
+    TotalBsmtSFGrLivArea = TotalBsmtSF/GrLivArea,
+    OverallCondSqrt = sqrt(OverallCond),
+    OverallCondSquare = OverallCond*OverallCond,
+    LotAreaSqrt = sqrt(LotArea),
+    FirstFlrSFSqrt = sqrt(FirstFlrSF),
+    TotRmsAbvGrdSqrt = sqrt(TotRmsAbvGrd)
   ) %>%
   fixNAs()
 
-for(column in transformedColumns %\% "SalePrice"){
-  test[[column]] <- log1p(test[[column]])
-}
-
 for(column in names(transformedCategories)){
   replacements <- transformedCategories[[column]]
-  test <- eval(parse(text = paste0("mutate(test, ", column, " = replacements[test$", column, "][[1]])")))
+  preparedtest <- eval(parse(text = paste0("mutate(preparedtest, ", column, " = replacements[preparedtest$", column, "][[1]])")))
 }
-
-write_csv(test, "deriveddata/test.csv")
 ```
 
 And, we're done! On to...
@@ -182,18 +236,28 @@ train <- temp %>% filter( train) %>% dplyr::select(-train)
 test  <- temp %>% filter(!train) %>% dplyr::select(-train)
 ```
 
+Also, I'm going to use Caret to fit the hyperparameters on models where that's useful, so I'm going to need a training controller for cross-validation.
+
+```{r CVController}
+fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+```
+
 ## Linear Model
 
 ```{r lm1}
-modelLM <- lm(SalePrice ~ ., data=train)
-summary(modelLM)
+#modelLM <- lm(SalePrice ~ ., data=train)
+modelLM <- train %>%
+  train(SalePrice ~ ., method = "lm", trControl = fitControl)
+  
+summary(modelLM)$r.squared
 ```
 
-Lots of useless stuff, some useful stuff, and a nice R^2. Not bad for a first stab, but how well does it actually score?
+Not bad for a first stab, but how well does it actually score?
 
 ```{r scorelm1}
-predictionLM <- predict(modelLM, test, type="response")
-rmse(log(test$SalePrice), log(predictionLM))
+modelLM %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
 
 OK, so that's our first quality benchmark.
@@ -203,59 +267,73 @@ OK, so that's our first quality benchmark.
 I thought about doing Ridge Regression or LASSO, but why do either when you can do both at once?
 
 ```{r ElasticNet}
-#modelEN <- glmnet(SalePrice ~ ., data=train)
-#predictionEN <- as.data.frame(predict(modelEN, test, type="response"))$s84
-#rmse(log(test$SalePrice), log(predictionEN))
+train %>%
+  ntbt_train(SalePrice ~ ., method = "glmnet", trControl = fitControl) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
 
 ## Cubist
 
+This one will burn through a few cycles, caveat emptor.
+
 ```{r Cubist}
-modelCubist <- cubist(x = dplyr::select(train, -SalePrice), y = train$SalePrice, committees = 50)
-predictionCubist <- predict(modelCubist, test)
-rmse(log(test$SalePrice), log(predictionCubist))
+train %>%
+  ntbt_train(SalePrice ~ ., method = "cubist", trControl = fitControl) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
 
 ## Random Forest
 
+This one will burn through a few cycles, caveat emptor.
+
 ```{r RandomForest}
-modelRF <- randomForest(SalePrice ~ ., data=factorize(train))
-predictionRF <- predict(modelRF, factorize(test), type="response")
-rmse(log(test$SalePrice), log(predictionRF))
+train %>%
+  factorize() %>%
+  ntbt_train(SalePrice ~ ., method = "rf", trControl = fitControl) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
 
 ## SVM
 
-```{r SVM}
-modelSVM <- svm(SalePrice ~ ., data=train)
-predictionSVM <- predict(modelSVM, test, type="response")
-rmse(log(test$SalePrice), log(predictionSVM))
+I actually started using Caret specifically to fit hyperparameters on SVMs.
+
+```{r SVM, warning=FALSE}
+train %>%
+  ntbt_train(SalePrice ~ ., method = "svmLinear2", trControl = fitControl) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
 
-## XGBoost
+## Gradient Boosting
+
+```{r}
+train %>%
+  ntbt_train(SalePrice ~ ., method = "gbm", trControl = fitControl, verbose = FALSE) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
+```
+
+## eXtreme Gradient Boosting
 
 ```{r xgboost}
-# TODO...
+train %>%
+  ntbt_train(SalePrice ~ ., method = "xgbLinear", trControl = fitControl) %>%
+  predict(test) %>%
+  rmse(test$SalePrice)
 ```
-
-## Crunch
-
-```{r Crunch}
-prediction <- (predictionLM + predictionCubist + predictionRF + predictionSVM) / 4
-rmse(log(test$SalePrice), log(prediction))
-```
-
-[Nice!](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/leaderboard)
 
 ## Make Some Predictions!
 
 Let's rerun it on the entire Kaggle training set, predict on the test set, write and submit it.
 
 ```{r writeOut}
-#modelCubist <- cubist(x = dplyr::select(rawtrain, -SalePrice), y = rawtrain$SalePrice, committees = 50)
-#predictionCubist <- predict(modelCubist, rawtest)
-
-#cbind(rawtest, predictionCubist) %>%
-#  dplyr::transmute(Id, SalePrice = predictionCubist) %>%
-#  write_csv("predictions/predictionCubist.csv")
+preparedtraining %>%
+  ntbt_train(SalePrice ~ ., method = "glmnet", trControl = fitControl) %>%
+  predict(preparedtest) %>%
+  cbind(preparedtest, SalePrice) %>%
+  dplyr::transmute(Id, SalePrice = expm1(SalePrice)) %>%
+  write_csv("predictions/predictionCubist.csv")
 ```
