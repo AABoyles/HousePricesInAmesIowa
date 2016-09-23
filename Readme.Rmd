@@ -15,6 +15,8 @@ library("plyr")
 library("dplyr")
 library("intubate")
 library("ggplot2")
+library("parallel")
+library("doMC")
 library("caret")
 library("MASS")
 library("glmnet")
@@ -42,7 +44,7 @@ That was uneventful.
 
 First things first! Some of these columns have names that start with numerals. That makes R ...itchy. Let's just fix that right quick:
 
-```{r}
+```{r renameVars}
 training %<>%
   dplyr::rename(
     FirstFlrSF  = `1stFlrSF`,
@@ -53,21 +55,159 @@ training %<>%
 
 Note that this won't affect the models in any meaningful way.
 
+## Missing Values
+
+There are a ton of them. They make the models fail. In a perfect world, we would analyze each column for its missingness and do multiple imputation to fill in the values we could reasonably impute, but I don't have the time or the patience for that. Instead, I'm just going to replace all missing values with the arithmetic mean of values in the that column for numeric columns, and "Unknown" for character columns.
+
+```{r fixMissing}
+training %<>%
+  fixNAs()
+```
+
 ## Feature Engineering
 
-I could do my own, but [Thibaut95k](https://www.kaggle.com/thibaut95k/house-prices-advanced-regression-techniques/notebook44688d615f/run/370172) has already done such an awesome job.
+Let's just take a look at these, one-by-one. Since there are 79 of them, it may take awhile, so feel free to skip to the end.
+
+### Year Built, Remodeled, Sold and Age
+
+```{r YearBuilt}
+ggplot(training, aes(YearBuilt, SalePrice)) + geom_point()
+```
+
+It looks like just knowing the Year in which the house was built will give us a solid model:
 
 ```{r}
-training %<>%
+lm(SalePrice ~ YearBuilt, data=training) %>%
+  summary()
+```
+
+But that graph looks curvilinear to me. Maybe there's a quadratic relationship as well:
+
+```{r}
+training %>%
+  mutate(YearBuilt2 = YearBuilt^2) %>%
+  ntbt_lm(SalePrice ~ YearBuilt2 + YearBuilt) %>%
+  summary()
+```
+
+Yup. Let's make sure it's in the model!
+
+```{r}
+training %<>% mutate(YearBuilt2 = YearBuilt^2)
+```
+
+How about Remodels?
+
+```{r}
+ggplot(training, aes(YearRemodAdd, SalePrice)) + geom_point()
+```
+
+Again, looks like some sort of curvilinear relationship. Let's look at 
+
+```{r}
+training %>%
+  mutate(YearRemodAdd2 = YearRemodAdd*YearRemodAdd) %>%
+  ntbt_lm(SalePrice ~ YearRemodAdd + YearRemodAdd2) %>%
+  summary()
+```
+
+Cool, so two more for the pile. 
+
+```{r}
+training %<>% mutate(YearRemodAdd2 = YearRemodAdd*YearRemodAdd)
+```
+
+How about the year it was sold?
+
+```{r}
+ggplot(training, aes(YrSold, SalePrice, group=YrSold)) + geom_violin()
+```
+
+Oh, this is fun: the data span the 2008 Housing Crash. Based on these violin plots, it looks like the crash didn't drive a huge decline in prices for mid-level houses, but did cut the long tail of more expensive sales. So, based on this, I wouldn't guess a model could do a ton with the sale year. Let's see:
+
+```{r}
+lm(SalePrice ~ YrSold, data=training) %>%
+  summary()
+```
+
+Yup. However, we also know the month in which the house was sold. I doubt the day of the month matters tremendoudly, but the month might.
+
+```{r}
+training %>%
+  mutate(dateSold = as.Date(paste0(YrSold, "/", MoSold, "/15"))) %>%
+  ggplot(aes(dateSold, SalePrice)) + geom_point() + geom_smooth()
+```
+
+But there may still be a way we can mine some useful information from this data. There's a funny little thing we don't know, but we *can* infer: the age of a house.
+
+```{r}
+training %>%
+  mutate(Age = YrSold - YearBuilt) %>%
+  ggplot(aes(Age, SalePrice)) +
+  geom_point()
+```
+
+```{r}
+training %>%
   mutate(
     Age = YrSold - YearBuilt,
-    AgeRemod = YrSold - YearRemodAdd,
+    OneAge = 1 / (1+Age),
+    AgeRemod = YrSold - YearRemodAdd
+  ) %>%
+  ntbt_lm(SalePrice ~ Age + OneAge + AgeRemod + YearBuilt + YearBuilt2 + YearRemodAdd + YearRemodAdd2) %>%
+  summary()
+```
+
+It seems there's more signal in the absolute year in which the house was built than there is in the actual age of the house. This may be a byproduct of the fact that the sales data comes from a comparatively narrow time window of about four years. Oh, and remodels fall out entirely. Never-the-less, it seems that the inverse-age of the house still carries some notable information.
+
+```{r}
+training %<>% mutate(OneAge = 1/(1+YrSold-YearBuilt))
+```
+
+### Size
+
+It matters, people.
+
+```{r}
+ggplot(training, aes(GrLivArea, SalePrice)) + geom_point()
+```
+
+Linear out of the box! Niiiiice.
+
+```{r}
+training %>%
+  mutate(
+    logGrLivArea = log(GrLivArea),
+    sqrtGrLivArea = sqrt(GrLivArea),
+    GrLivArea2 = GrLivArea^2,
+    GrLivArea3 = GrLivArea^3
+  ) %>%
+  ntbt_lm(SalePrice ~ logGrLivArea + sqrtGrLivArea + GrLivArea + GrLivArea2 + GrLivArea3) %>%
+  summary()
+```
+
+Now, I tortured this until it started giving me any less than three stars, so there's a *lot* to be said for square footage. Into the model it goes!
+
+```{r}
+training %>%
+  mutate(
+    logGrLivArea = log(GrLivArea),
+    sqrtGrLivArea = sqrt(GrLivArea),
+    GrLivArea2 = GrLivArea^2,
+    GrLivArea3 = GrLivArea^3
+  )
+```
+
+### Lot Features
+
+```{r engineerFeatures}
+training %<>%
+  mutate(
     Baths = FullBath + HalfBath,
     BsmtBaths = BsmtFullBath + BsmtHalfBath,
     OverallQualSquare = OverallQual*OverallQual,
     OverallQualCube = OverallQual*OverallQual*OverallQual,
     OverallQualExp = expm1(OverallQual),
-    GrLivAreaLog = log(GrLivArea),
     TotalBsmtSFGrLivArea = TotalBsmtSF/GrLivArea,
     OverallCondSqrt = sqrt(OverallCond),
     OverallCondSquare = OverallCond*OverallCond,
@@ -75,14 +215,6 @@ training %<>%
     FirstFlrSFSqrt = sqrt(FirstFlrSF),
     TotRmsAbvGrdSqrt = sqrt(TotRmsAbvGrd)
   )
-```
-
-## Missing Values
-
-There are a ton of them. They make the models fail. In a perfect world, we would analyze each column for its missingness and do multiple imputation to fill in the values we could reasonably impute, but I don't have the time or the patience for that. Instead, I'm just going to replace all missing values with the arithmetic mean of values in the that column for numeric columns, and "Unknown" for character columns.
-
-```{r fixMissing}
-training <- fixNAs(training)
 ```
 
 ## Outcome Transformation
@@ -99,14 +231,14 @@ You'll note that these values vary over several orders of magnitude (as [Alexand
 
 ```{r}
 training %>%
+  mutate(SalePrice = log1p(SalePrice)) %>%
   ggplot(aes(SalePrice)) +
-  geom_histogram() +
-  scale_x_log10()
+  geom_histogram()
 ```
 
 It certainly apprears to be closer to normally-distributed (which is helpful). What about the predictors? Well, let's take a look at some correlations:
 
-Note: I'll start cross-validating once I'm building models for prediction. These are just to determine whether or not a particular treatment (in this case, log-transformation) helps us.
+Note: I'll start cross-validating once I'm building models for prediction. These are just to give us a feel for whether or not a particular treatment (in this case, log-transformation) helps us.
 
 ```{r}
 training %>%
@@ -137,7 +269,7 @@ The simplest way to handle this is to drop any categorical variable with a value
 
 ```{r, eval=FALSE}
 # Note that this code is not run:
-training <- training %>% dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition, LotConfig))
+training %<>% dplyr::select(-c(MSZoning, Street, Alley, LotShape, Utilities, LandSlope, Neighborhood, Condition1, Condition2, HouseStyle, RoofStyle, RoofMatl, Exterior1st, Exterior2nd, MasVnrType, ExterQual, ExterCond, Foundation, BsmtCond, BsmtFinType2, Heating, HeatingQC, Electrical, Functional, GarageType, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType, SaleCondition, LotConfig))
 ```
 
 A better way to solve this problem is to translate ordinal variables onto a continuous scale. A computer can't figure out how far "good" is from "poor," but it can definitely figure out the difference between 4 and 1. That works adequately for ordinal variables, but its throwing away some discernable signal, and it works less well for nominal variables. For example, there is no inherent ordinality in countertop materials, but the market values granite more highly than formica. This is particularly instructive: instead of assuming that an ordinal variable follows its order, let's actually take the mean price for each category and see whether it follows the implied ordering.
@@ -191,7 +323,7 @@ Sadly, not, though it doesn't seem to hurt us much. More importantly, it resolve
 
 Training is all set to go! Now we just need to give test the same treatment...
 
-```{r fixTest}
+```{r fixTest, message = FALSE}
 preparedtraining <- training
 
 preparedtest <- read_csv("rawdata/test.csv") %>%
@@ -199,10 +331,16 @@ preparedtest <- read_csv("rawdata/test.csv") %>%
     FirstFlrSF  = `1stFlrSF`,
     SecondFlrSF = `2ndFlrSF`,
     ThreeSsnPorch = `3SsnPorch`
-  ) %>% 
+  ) %>%
+  fixNAs() %>%
   mutate(
-    Age = YrSold - YearBuilt,
-    AgeRemod = YrSold - YearRemodAdd,
+    YearBuilt2 = YearBuilt^2,
+    YearRemodAdd2 = YearRemodAdd*YearRemodAdd,
+    logGrLivArea = log(GrLivArea),
+    sqrtGrLivArea = sqrt(GrLivArea),
+    GrLivArea2 = GrLivArea^2,
+    GrLivArea3 = GrLivArea^3,
+    OneAge = 1/(1+YrSold - YearBuilt),
     Baths = FullBath + HalfBath,
     BsmtBaths = BsmtFullBath + BsmtHalfBath,
     OverallQualSquare = OverallQual*OverallQual,
@@ -215,8 +353,7 @@ preparedtest <- read_csv("rawdata/test.csv") %>%
     LotAreaSqrt = sqrt(LotArea),
     FirstFlrSFSqrt = sqrt(FirstFlrSF),
     TotRmsAbvGrdSqrt = sqrt(TotRmsAbvGrd)
-  ) %>%
-  fixNAs()
+  )
 
 for(column in names(transformedCategories)){
   replacements <- transformedCategories[[column]]
@@ -240,6 +377,7 @@ Also, I'm going to use Caret to fit the hyperparameters on models where that's u
 
 ```{r CVController}
 fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+registerDoMC(cores = detectCores() - 1)
 ```
 
 ## Linear Model
@@ -247,14 +385,14 @@ fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
 ```{r lm1}
 #modelLM <- lm(SalePrice ~ ., data=train)
 modelLM <- train %>%
-  train(SalePrice ~ ., method = "lm", trControl = fitControl)
+  ntbt_train(SalePrice ~ ., method = "lm", trControl = fitControl)
   
 summary(modelLM)$r.squared
 ```
 
 Not bad for a first stab, but how well does it actually score?
 
-```{r scorelm1}
+```{r scorelm1, warning=FALSE}
 modelLM %>%
   predict(test) %>%
   rmse(test$SalePrice)
@@ -300,7 +438,7 @@ train %>%
 
 I actually started using Caret specifically to fit hyperparameters on SVMs.
 
-```{r SVM, warning=FALSE}
+```{r SVM, warning=FALSE, eval=FALSE}
 train %>%
   ntbt_train(SalePrice ~ ., method = "svmLinear2", trControl = fitControl) %>%
   predict(test) %>%
@@ -309,18 +447,9 @@ train %>%
 
 ## Gradient Boosting
 
-```{r}
+```{r GradientBoosting}
 train %>%
   ntbt_train(SalePrice ~ ., method = "gbm", trControl = fitControl, verbose = FALSE) %>%
-  predict(test) %>%
-  rmse(test$SalePrice)
-```
-
-## eXtreme Gradient Boosting
-
-```{r xgboost}
-train %>%
-  ntbt_train(SalePrice ~ ., method = "xgbLinear", trControl = fitControl) %>%
   predict(test) %>%
   rmse(test$SalePrice)
 ```
@@ -330,10 +459,17 @@ train %>%
 Let's rerun it on the entire Kaggle training set, predict on the test set, write and submit it.
 
 ```{r writeOut}
-preparedtraining %>%
-  ntbt_train(SalePrice ~ ., method = "glmnet", trControl = fitControl) %>%
-  predict(preparedtest) %>%
-  cbind(preparedtest, SalePrice) %>%
-  dplyr::transmute(Id, SalePrice = expm1(SalePrice)) %>%
-  write_csv("predictions/predictionCubist.csv")
+LM <- predict(train(SalePrice ~ ., data = preparedtraining, method = "lm", trControl = fitControl), preparedtest)
+EN <- predict(train(SalePrice ~ ., data = preparedtraining, method = "glmnet", trControl = fitControl), preparedtest)
+C  <- predict(train(SalePrice ~ ., data = preparedtraining, method = "cubist", trControl = fitControl), preparedtest)
+#RF <- predict(train(SalePrice ~ ., data = factorize(preparedtraining), method = "rf", trControl = fitControl), factorize(preparedtest))
+GBM <- predict(train(SalePrice ~ ., data = preparedtraining, method = "gbm", trControl = fitControl), preparedtest)
+
+cbind(
+  preparedtest,
+  LM, EN, C, GBM
+  ) %>%
+  mutate(SalePrice = expm1((LM + EN + C + GBM) / 4)) %>%
+  dplyr::select(Id, SalePrice) %>%
+  write_csv("predictions/predictionMean.csv")
 ```
